@@ -9,7 +9,11 @@ import           Control.Lens
 import           Control.Monad.Trans.Class
 import           Control.Monad.Trans.State
 import           Data.Bifunctor
+import           Data.IntSet               (IntSet)
+import qualified Data.IntSet               as IS
 import           Data.List                 (intercalate, sort)
+import           Data.Map                  (Map)
+import qualified Data.Map                  as M
 import qualified Data.Vector               as V
 import qualified Pipes                     as P
 import qualified Pipes.Core                as P
@@ -89,6 +93,9 @@ data Ship
   | Cruiser
   | Patrol
     deriving (Eq, Ord, Show)
+
+allShips :: [Ship]
+allShips = [Carrier, Battleship, Submarine, Cruiser, Patrol]
 
 shipSize :: Ship -> (Int, Int)
 shipSize Carrier    = (1, 5)
@@ -173,13 +180,12 @@ moveTo :: Position -> Board a -> Board a
 moveTo pos (Board ships _ grid) = Board ships pos grid
 
 boardFilled :: Board a -> Bool
-boardFilled (Board ships _ _) =
-  allShips == [Carrier, Battleship, Submarine, Cruiser, Patrol]
-  where
-    allShips = sort (ships ^.. traverse._1)
+boardFilled (Board ships _ _) = sort (ships ^.. traverse._1) == allShips
 
 -- RUNNING A GAME
 --
+
+type BoardSetup = Board (Either Distance Ship)
 
 data Player
   = P1
@@ -211,7 +217,8 @@ type Player2 m = Move -> m (Position, PlayerM m)
 
 data PlayerState
   = PlayerState{ _playerId    :: Player
-               , _playerBoard :: Board Distance
+               , _playerBoard :: BoardSetup
+               , _playerSunk  :: Map Ship IntSet
                }
 makeLenses ''PlayerState
 
@@ -222,8 +229,8 @@ data GameState
 makeLenses ''GameState
 
 runBattleship :: forall m. Monad m
-              => (Board Distance, Player1 m)
-              -> (Board Distance, Player2 m)
+              => (BoardSetup, Player1 m)
+              -> (BoardSetup, Player2 m)
               -> P.Producer Move m GameResult
 runBattleship (p1Board, p1') (p2Board, p2') =
   withPreparedBoards p1Board p2Board $ \st0 ->
@@ -253,7 +260,7 @@ runBattleship (p1Board, p1') (p2Board, p2') =
          (move1, gamePlayer2, P.hoist lift p2)
 
 withPreparedBoards :: Applicative m
-                   => Board Distance -> Board Distance
+                   => BoardSetup -> BoardSetup
                    -> (GameState -> m GameResult)
                    -> m GameResult
 withPreparedBoards b1 b2 k
@@ -261,14 +268,23 @@ withPreparedBoards b1 b2 k
   | boardFilled b1 = pure (UnfilledBoard P2)
   | otherwise      = pure (UnfilledBoard P1)
 
-initGameState :: Board Distance -> Board Distance -> GameState
+initGameState :: BoardSetup -> BoardSetup -> GameState
 initGameState b1 b2 =
-  GameState (PlayerState P1 b1) (PlayerState P2 b2)
+  GameState (PlayerState P1 b1 initialMap) (PlayerState P2 b2 initialMap)
+  where
+    initialMap = M.fromList [ (ship, IS.fromList [0..snd (shipSize ship)-1])
+                            | ship <- allShips
+                            ]
+
 
 checkHit :: Monad m => Position -> StateT PlayerState m Move
 checkHit pos = do
-  p <- use playerId
-  return (Hit (otherPlayer p) pos)
+  p    <- uses playerId otherPlayer
+  here <- uses playerBoard extract
+  case here of
+    Left _ -> return (Miss p pos)
+    Right ship -> do
+      return (Hit p pos)
 
 checkWon :: Monad m => StateT PlayerState m (Maybe GameResult)
 checkWon = do

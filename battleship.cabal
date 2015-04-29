@@ -24,6 +24,7 @@ library
       base >=4.8 && <4.9
     , bifunctors
     , comonad
+    , containers
     , lens
     , pipes
     , transformers
