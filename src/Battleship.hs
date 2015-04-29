@@ -4,10 +4,12 @@
 
 module Battleship where
 
+import           Control.Comonad
 import           Control.Lens
 import           Control.Monad.Trans.Class
 import           Control.Monad.Trans.State
 import           Data.Bifunctor
+import           Data.List                 (intercalate, sort)
 import qualified Data.Vector               as V
 import qualified Pipes                     as P
 import qualified Pipes.Core                as P
@@ -56,8 +58,9 @@ newtype Position
   = Position (Int, Int)
     deriving (Eq, Show)
 
-position :: Prism' (Int, Int) Position
-position = prism' (\(Position xy) -> xy) $ \(x,y) -> do
+-- Hiding the constructor and only exposing a prism ensures validity.
+_Position :: Prism' (Int, Int) Position
+_Position = prism' (\(Position xy) -> xy) $ \(x,y) -> do
   True <- Just (0 <= x && x < 10 && 0 <= y && y < 10)
   return (Position (x,y))
 
@@ -66,8 +69,13 @@ newtype Distance
   = Distance (Int, Int)
     deriving (Eq, Show)
 
+_Distance :: Prism' (Int, Int) Distance
+_Distance = prism' (\(Distance xy) -> xy) $ \(x,y) -> do
+  True <- Just (0 <= x && x < 10 && 0 <= y && y < 10)
+  return (Distance (x,y))
+
 data Orientation
-  = Right
+  = Across
   | Down
     deriving (Eq, Show)
 
@@ -80,7 +88,7 @@ data Ship
   | Submarine
   | Cruiser
   | Patrol
-    deriving (Eq, Show)
+    deriving (Eq, Ord, Show)
 
 shipSize :: Ship -> (Int, Int)
 shipSize Carrier    = (1, 5)
@@ -93,21 +101,77 @@ shipSize Patrol     = (1, 1)
 --
 
 data Board a
-  = Board [(Ship, Orientation, Position)] (V.Vector a)
+  = Board [(Ship, Orientation, Position)] Position (V.Vector a)
+
+instance Show a => Show (Board a) where
+  show (Board ships pos grid)
+    = unlines
+    . map (intercalate " " . V.toList . V.map show)
+    $ map (\x -> V.slice (x*10) 10 grid) [0..9]
 
 instance Functor Board where
-  fmap f (Board ships xs) =
-    Board ships (fmap f xs)
+  fmap f (Board ships pos xs) =
+    Board ships pos (fmap f xs)
 
-emptyBoard :: a -> Board a
-emptyBoard x = Board [] (V.replicate 100 x)
+instance Comonad Board where
+  extract (Board _ (Position (x,y)) grid) =
+    grid V.! (x + (y*10))
+  extend f (Board ships pos grid) =
+    Board ships pos $
+      V.imap (\i _ -> f (Board ships (Position (i `mod` 10, i `div` 10)) grid))
+             grid
 
-placeShip :: Ship -> Orientation -> Position
+emptyBoard :: Board Distance
+emptyBoard = Board [] (Position (0,0)) $ V.generate 100 go
+  where
+    go i = Distance (10 - (i `mod` 10), 10 - (i `div` 10))
+
+placeShip :: Ship -> Orientation
           -> Board Distance -> Maybe (Board Distance)
-placeShip = undefined
+placeShip ship dir b@(Board ships pos grid) = case dir of
+  Across -> do
+    let Distance (x,y) = extract b
+        (shipWidth, shipLength) = shipSize ship
+    if x < shipLength || y < shipWidth then Nothing
+      else do
+        Just $ b =>> (updateAbove pos shipLength) =>> (updateLeft pos shipWidth)
+  Down -> undefined
+
+updateAbove :: Position -> Int -> Board Distance -> Distance
+updateAbove (Position (newx, newy)) n board =
+  if x < newx || x >= newx + n || newy < y then dist
+    else Distance (dx, min (newy - y) dy)
+  where
+    dist@(Distance (dx,dy)) = extract board
+    Position (x,y) = boardPosition board
+
+updateLeft :: Position -> Int -> Board Distance -> Distance
+updateLeft (Position (newx, newy)) n board =
+  if y < newy || y >= newy + n || newx < x then dist
+    else Distance (min (newx - x) dx, dy)
+  where
+    dist@(Distance (dx,dy)) = extract board
+    Position (x,y) = boardPosition board
+
+boardPosition :: Board a -> Position
+boardPosition (Board _ pos _) = pos
+
+moveRight :: Int -> Board a -> Maybe (Board a)
+moveRight n (Board ships (Position (x,y)) grid) =
+  if n+x < 10 then Just (Board ships (Position (n+x, y)) grid) else Nothing
+
+moveDown :: Int -> Board a -> Maybe (Board a)
+moveDown n (Board ships (Position (x,y)) grid) =
+  if n+y < 10 then Just (Board ships (Position (x, n+y)) grid) else Nothing
+
+moveTo :: Position -> Board a -> Board a
+moveTo pos (Board ships _ grid) = Board ships pos grid
 
 boardFilled :: Board a -> Bool
-boardFilled = undefined
+boardFilled (Board ships _ _) =
+  allShips == [Carrier, Battleship, Submarine, Cruiser, Patrol]
+  where
+    allShips = sort (ships ^.. traverse._1)
 
 -- RUNNING A GAME
 --
@@ -116,6 +180,10 @@ data Player
   = P1
   | P2
     deriving (Eq, Show)
+
+otherPlayer :: Player -> Player
+otherPlayer P1 = P2
+otherPlayer P2 = P1
 
 data Move
   = Hit Player Position
@@ -135,55 +203,67 @@ type Player1 m =         m (Position, PlayerM m)
 -- Player 2 sees what move Player 1 made in their first move.
 type Player2 m = Move -> m (Position, PlayerM m)
 
+data PlayerState
+  = PlayerState{ _playerId    :: Player
+               , _playerBoard :: Board Distance
+               }
+makeLenses ''PlayerState
+
 data GameState
-  = GameState{ _statePlayer1 :: (Player, Board Distance)
-             , _statePlayer2 :: (Player, Board Distance)
+  = GameState{ _gamePlayer1 :: PlayerState
+             , _gamePlayer2 :: PlayerState
              }
 makeLenses ''GameState
 
-runBattleship :: Monad m
+runBattleship :: forall m. Monad m
               => (Board Distance, Player1 m)
               -> (Board Distance, Player2 m)
               -> P.Producer Move m GameResult
 runBattleship (p1Board, p1') (p2Board, p2') =
-  withPreparedBoards p1Board p2Board $ \b1 b2 ->
-  P.hoist (flip evalStateT undefined) $ do
-    -- Kick off the two players
+  withPreparedBoards p1Board p2Board $ \st0 ->
+  P.hoist (flip evalStateT st0) $ do
+    -- Kick off player 1
     (pos1, p1) <- lift (lift p1')
-    let move0 = checkHit b2 P1 pos1
+    move0 <- lift . zoom gamePlayer1 $ checkHit pos1
     P.yield move0
 
+    -- ...and player 2
     (pos2, p2) <- lift (lift (p2' move0))
-    let move1 = checkHit b1 P2 pos2
+    move1 <- lift . zoom gamePlayer2 $ checkHit pos2
     P.yield move1
 
-    let loop :: Monad m
-             => Move -> Move
-             -> (Player, Board Distance, PlayerM (StateT GameState m))
-             -> (Player, Board Distance, PlayerM (StateT GameState m))
-             -> P.Producer Move (StateT GameState m) GameResult
-        loop movex movey (px, bx, ResumptionT mx) (py, by, my) = do
+    -- Loop between the two players, using two lenses as pointers to switch
+    -- between them.
+    let loop (movex, lensx, ResumptionT mx) (movey, lensy, my) = do
           (posx, mx') <- lift (mx (movex, movey))
-          let move = checkHit by px posx
+          move <- lift . zoom (cloneLens lensx) $ checkHit posx
           P.yield move
-          hasWon <- lift (zoom statePlayer1 checkWon)
-          if hasWon then return (Won px)
-            else loop move movex (py, by, my) (px, bx, mx')
+          hasWon <- lift $ zoom (cloneLens lensx) checkWon
+          case hasWon of
+            Just result -> return result
+            Nothing     -> loop (move, lensy, my) (movex, lensx, mx')
 
-    loop move0 move1 (P1, b1, (P.hoist lift p1)) (P2, b2, (P.hoist lift p2))
+    loop (move0, gamePlayer1, P.hoist lift p1)
+         (move1, gamePlayer2, P.hoist lift p2)
 
 withPreparedBoards :: Applicative m
                    => Board Distance -> Board Distance
-                   -> (Board Distance -> Board Distance -> m GameResult)
+                   -> (GameState -> m GameResult)
                    -> m GameResult
 withPreparedBoards b1 b2 k
-  | boardFilled b1 && boardFilled b2 = k b1 b2
+  | boardFilled b1 && boardFilled b2 = k (initGameState b1 b2)
   | boardFilled b1 = pure (UnfilledBoard P2)
   | otherwise      = pure (UnfilledBoard P1)
 
-checkHit :: Board Distance -> Player -> Position -> Move
-checkHit board player pos =
-  Hit player pos
+initGameState :: Board Distance -> Board Distance -> GameState
+initGameState b1 b2 =
+  GameState (PlayerState P1 b1) (PlayerState P2 b2)
 
-checkWon :: Monad m => StateT (Board Distance) m Bool
-checkWon = return True
+checkHit :: Monad m => Position -> StateT PlayerState m Move
+checkHit pos = do
+  p <- use playerId
+  return (Hit (otherPlayer p) pos)
+
+checkWon :: Monad m => StateT PlayerState m (Maybe GameResult)
+checkWon = do
+  return Nothing
