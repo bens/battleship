@@ -104,7 +104,7 @@ data Board a
   = Board [(Ship, Orientation, Position)] Position (V.Vector a)
 
 instance Show a => Show (Board a) where
-  show (Board ships pos grid)
+  show (Board _ _ grid)
     = unlines
     . map (intercalate " " . V.toList . V.map show)
     $ map (\x -> V.slice (x*10) 10 grid) [0..9]
@@ -128,14 +128,19 @@ emptyBoard = Board [] (Position (0,0)) $ V.generate 100 go
 
 placeShip :: Ship -> Orientation
           -> Board Distance -> Maybe (Board Distance)
-placeShip ship dir b@(Board ships pos grid) = case dir of
-  Across -> do
-    let Distance (x,y) = extract b
-        (shipWidth, shipLength) = shipSize ship
-    if x < shipLength || y < shipWidth then Nothing
-      else do
-        Just $ b =>> (updateAbove pos shipLength) =>> (updateLeft pos shipWidth)
-  Down -> undefined
+placeShip ship dir b@(Board _ pos _) =
+  let Distance (x,y) = extract b
+      (shipWidth, shipLength) = shipSize ship
+      addShip (Board ships pos' grid) = Board ((ship, dir, pos'):ships) pos' grid
+  in case dir of
+    Across ->
+      if x < shipLength || y < shipWidth then Nothing
+        else return . addShip $
+               b =>> updateAbove pos shipLength =>> updateLeft pos shipWidth
+    Down ->
+      if y < shipLength || x < shipWidth then Nothing
+        else return . addShip $
+               b =>> updateLeft pos shipLength =>> updateAbove pos shipWidth
 
 updateAbove :: Position -> Int -> Board Distance -> Distance
 updateAbove (Position (newx, newy)) n board =
@@ -188,6 +193,7 @@ otherPlayer P2 = P1
 data Move
   = Hit Player Position
   | Miss Player Position
+  | Sunk Player Ship Position
     deriving (Eq, Show)
 
 data GameResult
